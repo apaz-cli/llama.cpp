@@ -16,6 +16,18 @@
  #endif
 
 bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
+    // determine sensible default number of threads.
+    // std::thread::hardware_concurrency may not be equal to the number of cores, or may return 0.
+#ifdef __linux__
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    params.n_threads = std::count(std::istream_iterator<std::string>(cpuinfo),
+                                  std::istream_iterator<std::string>(),
+                                  std::string("processor"));
+#endif
+    if (params.n_threads == 0) {
+        params.n_threads = std::max(1, (int32_t) std::thread::hardware_concurrency());
+    }
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
 
@@ -37,6 +49,8 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             params.n_predict = std::stoi(argv[++i]);
         } else if (arg == "--top_k") {
             params.top_k = std::stoi(argv[++i]);
+        } else if (arg == "-c" || arg == "--ctx_size") {
+            params.n_ctx = std::stoi(argv[++i]);
         } else if (arg == "--top_p") {
             params.top_p = std::stof(argv[++i]);
         } else if (arg == "--temp") {
@@ -92,6 +106,7 @@ void gpt_print_usage(int argc, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  --top_p N             top-p sampling (default: %.1f)\n", params.top_p);
     fprintf(stderr, "  --repeat_last_n N     last n tokens to consider for penalize (default: %d)\n", params.repeat_last_n);
     fprintf(stderr, "  --repeat_penalty N    penalize repeat sequence of tokens (default: %.1f)\n", params.repeat_penalty);
+    fprintf(stderr, "  -c N, --ctx_size N    size of the prompt context (default: %d)\n", params.n_ctx);
     fprintf(stderr, "  --temp N              temperature (default: %.1f)\n", params.temp);
     fprintf(stderr, "  -b N, --batch_size N  batch size for prompt processing (default: %d)\n", params.n_batch);
     fprintf(stderr, "  -m FNAME, --model FNAME\n");
@@ -486,7 +501,8 @@ size_t ggml_quantize_q4_0(float * src, void * dst, int n, int k, int qk, int64_t
 
 size_t ggml_quantize_q4_1(float * src, void * dst, int n, int k, int qk, int64_t * hist) {
     const int nb = k / qk;
-    const size_t row_size = nb*(2*sizeof(float) + sizeof(uint8_t)*qk/2);
+    const size_t bs = (2*sizeof(float) + sizeof(uint8_t)*qk/2);
+    const size_t row_size = nb*bs;
 
     assert(k % qk == 0);
 
@@ -495,10 +511,10 @@ size_t ggml_quantize_q4_1(float * src, void * dst, int n, int k, int qk, int64_t
 
     char * pdst = (char *) dst;
 
-    for (int j = 0; j < n; j += k) {
-        float   * pm = (float *)   (pdst + (j/k)*row_size);
-        float   * pd = (float *)   (pm + nb);
-        uint8_t * pb = (uint8_t *) (pd + nb);
+    for (int j = 0; j < n; j += k) { 
+        uint8_t * pd = (uint8_t *) (pdst + (j/k)*row_size + 0*bs);
+        uint8_t * pm = (uint8_t *) (pdst + (j/k)*row_size + 0*bs +   sizeof(float));
+        uint8_t * pb = (uint8_t *) (pdst + (j/k)*row_size + 0*bs + 2*sizeof(float));
 
         //printf("n = %d, k = %d, nb = %d, row_size = %d, j = %d, pm = %p, pd = %p, pb = %p\n", n, k, nb, row_size, j, pm, pd, pb);
 
@@ -516,8 +532,10 @@ size_t ggml_quantize_q4_1(float * src, void * dst, int n, int k, int qk, int64_t
                 const float d = (max - min) / ((1 << 4) - 1);
                 const float id = d ? 1.0f/d : 0.0f;
 
-                pm[i] = min;
-                pd[i] = d;
+                *(float *) pd = d;
+                *(float *) pm = min;
+                pd += bs; 
+                pm += bs;
 
                 for (int l = 0; l < qk; l += 2) {
                     const float v0 = (src[j + i*qk + l + 0] - min)*id;
@@ -535,7 +553,8 @@ size_t ggml_quantize_q4_1(float * src, void * dst, int n, int k, int qk, int64_t
                     pp[l/2] = vi0 | (vi1 << 4);
                 }
 
-                memcpy(pb + i*qk/2, pp, pp_size);
+                memcpy(pb, pp, pp_size);
+                pb += bs;
             }
         }
     }
