@@ -771,6 +771,8 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const int nb = n / QK_MXFP4;
 
+    printf("ggml_vec_dot_mxfp4_q8_0: n = %d, nb = %d, QK_MXFP4 = %d\n", n, nb, QK_MXFP4);
+
     int ib = 0;
     float sumf = 0;
 
