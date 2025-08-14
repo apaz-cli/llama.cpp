@@ -1,3 +1,5 @@
+#include <immintrin.h>
+#include <climits>
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 #include "ggml-quants.h"
@@ -757,6 +759,73 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined __AVX512VBMI__
+// AVX-512 vectorized version
+// Takes 16 packed 32-bit integers (each containing an 8-bit value in lower bits)
+// Returns 16 packed float32 results
+static inline __m512 ggml_e8m0_to_fp32_avx512(__m512i x_vec) {
+    // Mask off only the lower 8 bits of each 32-bit element
+    __m512i x_masked = _mm512_and_epi32(x_vec, _mm512_set1_epi32(0xFF));
+    
+    // Create zero mask: 0xFFFFFFFF where x == 0, 0x00000000 elsewhere
+    __m512i zero_mask = _mm512_cmpeq_epi32_mask(x_masked, _mm512_setzero_si512());
+    zero_mask = _mm512_mask_set1_epi32(_mm512_setzero_si512(), 
+                                       _mm512_cmpeq_epi32_mask(x_masked, _mm512_setzero_si512()), 
+                                       0xFFFFFFFF);
+    
+    // For non-zero values: shift left by 23 bits
+    __m512i shifted = _mm512_slli_epi32(x_masked, 23);
+    
+    // Create the special value for zero case: 0x00400000
+    __m512i zero_value = _mm512_set1_epi32(0x00400000);
+    
+    // Select between zero_value and shifted based on zero_mask
+    __m512i result_bits = _mm512_mask_blend_epi32(
+        _mm512_cmpeq_epi32_mask(x_masked, _mm512_setzero_si512()),
+        shifted,      // Use this when mask is 0 (non-zero values)
+        zero_value    // Use this when mask is 1 (zero values)
+    );
+    
+    // Reinterpret as float
+    return _mm512_castsi512_ps(result_bits);
+}
+
+static inline __m512 ggml_e8m0_to_fp32_half_avx512(__m512i x_vec) {
+    // Mask off only the lower 8 bits of each 32-bit element
+    __m512i x_masked = _mm512_and_epi32(x_vec, _mm512_set1_epi32(0xFF));
+    
+    // Create mask for small values (x < 2)
+    __mmask16 small_mask = _mm512_cmplt_epi32_mask(x_masked, _mm512_set1_epi32(2));
+    
+    // For small values: handle x=0 and x=1 cases
+    // x=0: 0x00200000, x=1: 0x00400000
+    __mmask16 is_zero = _mm512_mask_cmpeq_epi32_mask(small_mask, x_masked, _mm512_setzero_si512());
+    __mmask16 is_one = _mm512_mask_cmpeq_epi32_mask(small_mask, x_masked, _mm512_set1_epi32(1));
+    
+    __m512i small_bits = _mm512_setzero_si512();
+    small_bits = _mm512_mask_mov_epi32(small_bits, is_zero, _mm512_set1_epi32(0x00200000));
+    small_bits = _mm512_mask_mov_epi32(small_bits, is_one, _mm512_set1_epi32(0x00400000));
+    
+    // For large values: (x - 1) << 23
+    __m512i large_bits = _mm512_slli_epi32(_mm512_sub_epi32(x_masked, _mm512_set1_epi32(1)), 23);
+    
+    // Select between small and large values
+    __m512i result_bits = _mm512_mask_mov_epi32(large_bits, small_mask, small_bits);
+    
+    return _mm512_castsi512_ps(result_bits);
+}
+
+static inline __m256i bytes_from_nibbles_128i_to_256i(__m128i tmp) {
+    return _mm256_and_si256(_mm256_set1_epi8(0xF), __builtin_ia32_vinsertf128_si256(_mm256_castsi128_si256(tmp), _mm_srli_epi16(tmp, 4), 1));
+}
+
+static inline __m512i bytes_from_nibbles_2x128i_to_512i(__m128i tmp1, __m128i tmp2) {
+    __m256i combined = _mm256_inserti128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);    
+    return _mm512_and_si512(_mm512_set1_epi8(0xF), 
+                           _mm512_inserti64x4(_mm512_castsi256_si512(combined), _mm256_srli_epi16(combined, 4), 1));
+}
+#endif
+
 void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
@@ -774,7 +843,78 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     int ib = 0;
     float sumf = 0;
 
-#if defined __AVX2__
+#if defined __AVX512VBMI__
+
+    // Broadcast the 16 MXFP4 lookup values across all 512 bits
+    const __m512i kvalues_mxfp4_vec = _mm512_broadcast_i32x8(_mm_loadu_si256((const __m128i*)kvalues_mxfp4));
+
+    // Initialize accumulator for final results
+    __m512 accum = _mm512_setzero_ps();
+
+    // Process 4 blocks at once. This is because each mxfp4 block contains 32 elements.
+    // 4 blocks times 32 elements per block at 4 bits for each element each equals our vector size, 512 bits.
+    for (; ib + 3 < nb; ib += 4) {
+        const __m512i m4b = _mm512_set1_epi8(0x0F); // All elements 0x0F
+        const __m512i mone = _mm512_set1_epi16(1);
+
+        // Load 4 blocks of mxfp4 elements and widen the nibbles into bytes.
+        // Also load the scales for each block. These loads are all done in order.
+        float scale_e8_0 = GGML_E8M0_TO_FP32_HALF(x[ib + 0].e);
+        const __m128i q4_0 = _mm_loadu_si128((const __m128i*)&x[ib + 0].qs);
+        float scale_e8_1 = GGML_E8M0_TO_FP32_HALF(x[ib + 1].e);
+        const __m128i q4_1 = _mm_loadu_si128((const __m128i*)&x[ib + 1].qs);
+        float scale_e8_2 = GGML_E8M0_TO_FP32_HALF(x[ib + 2].e);
+        const __m128i q4_2 = _mm_loadu_si128((const __m128i*)&x[ib + 2].qs);
+        float scale_e8_3 = GGML_E8M0_TO_FP32_HALF(x[ib + 3].e);
+        const __m128i q4_3 = _mm_loadu_si128((const __m128i*)&x[ib + 3].qs);
+
+        const __m512i q4b_01 = bytes_from_nibbles_2x128i_to_512i(q4_0, q4_1);
+        const __m512i q4b_34 = bytes_from_nibbles_2x128i_to_512i(q4_2, q4_3);
+        
+        // Load 4 blocks of q8 elements
+        static_assert(QK8_0 * 8 == 256, "Wrong q8_0 size");
+        const __m256i q8b_0 = _mm256_loadu_si256((const __m256i*)&y[ib + 0].qs);
+        const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)&y[ib + 1].qs);
+        const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)&y[ib + 2].qs);
+        const __m256i q8b_3 = _mm256_loadu_si256((const __m256i*)&y[ib + 3].qs);
+
+        // Expand 4 bit q4b_all vector to two 8 bit, then to eight 32 bit int vectors
+        const __m512i q4b_low = _mm512_and_si512(q4b_all, m4b);
+        const __m512i q4b_high = _mm512s_and_si512(_mm512_srli_epi16(q4b_all, 4), m4b);
+        const __m512i q4b_0 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(q4b_low, 0));
+        const __m512i q4b_1 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(q4b_low, 1));
+        const __m512i q4b_2 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(q4b_low, 2));
+        const __m512i q4b_3 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(q4b_low, 3));
+        const __m512i q4b_4 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(q4b_high, 0));
+        const __m512i q4b_5 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(q4b_high, 1));
+        const __m512i q4b_6 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(q4b_high, 2));
+        const __m512i q4b_7 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(q4b_high, 3));
+
+        // Convert int vectors to float vectors by shifting the significand and mantissa into place
+
+        
+
+
+        // Calculate scales for each block
+        // Scale = y[i].d * (x[i].e converted from E8M0 to float)
+        const float scale4_0 = GGML_CPU_FP16_TO_FP32(y[ib + 0].d) * GGML_E8M0_TO_FP32_HALF(x[ib + 0].e);
+        const float scale4_1 = GGML_CPU_FP16_TO_FP32(y[ib + 1].d) * GGML_E8M0_TO_FP32_HALF(x[ib + 1].e);
+        const float scale4_2 = GGML_CPU_FP16_TO_FP32(y[ib + 2].d) * GGML_E8M0_TO_FP32_HALF(x[ib + 2].e);
+        const float scale4_3 = GGML_CPU_FP16_TO_FP32(y[ib + 3].d) * GGML_E8M0_TO_FP32_HALF(x[ib + 3].e);
+        const float scale8_0;
+        const float scale8_1;
+        const float scale8_2;
+        const float scale8_3;
+
+        // Fused multiply-add: accum += scales * dot_products
+        accum = _mm512_fmadd_ps(scales_01, pf_01, accum);
+        accum = _mm512_fmadd_ps(scales_23, pf_23, accum);
+    }
+
+    // Horizontal sum of all 16 floats in the accumulator
+    sumf = _mm512_reduce_add_ps(accum);
+
+#elif defined __AVX2__
 
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_mxfp4);
     const __m128i m4b  = _mm_set1_epi8(0x0f);
@@ -829,6 +969,8 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     sumf = hsum_float_8(accum);
 
 #endif
+
+    // Scalar fallback for remaining blocks
     for (; ib < nb; ++ib) {
         const float d = GGML_CPU_FP16_TO_FP32(y[ib].d)*GGML_E8M0_TO_FP32_HALF(x[ib].e);
         int sumi1 = 0;
