@@ -1,5 +1,4 @@
 #include <immintrin.h>
-#include <climits>
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 #include "ggml-quants.h"
@@ -788,7 +787,7 @@ static inline __m512 ggml_e8m0_to_fp32_half_avx512(__m512i x_vec) {
 
 static inline __m256i bytes_from_nibbles_128i_to_256i(__m128i tmp) {
     return _mm256_and_si256(_mm256_set1_epi8(0xF), 
-                __builtin_ia32_vinsertf128_si256(_mm256_castsi128_si256(tmp), _mm_srli_epi16(tmp, 4), 1));
+                _mm256_insertf128_si256(_mm256_castsi128_si256(tmp), _mm_srli_epi16(tmp, 4), 1));
 }
 
 static inline __m512i bytes_from_nibbles_2x128i_to_512i(__m128i tmp1, __m128i tmp2) {
@@ -834,11 +833,15 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #if defined __AVX512VBMI__
 
+    static_assert(QK8_0 * 8 == 256, "Wrong q8_0 size");
+
     // Load the kvalues lookup table
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_mxfp4);
+    const __m512i values512 = _mm512_broadcast_i32x4(values128);
 
     // Initialize accumulator for final results
-    __m512 accum = _mm512_setzero_ps();
+    __m512 accum1 = _mm512_setzero_ps();
+    __m512 accum2 = _mm512_setzero_ps();
 
     // Process 4 blocks at once. This is because each mxfp4 block contains 32 elements.
     // 4 blocks times 32 elements per block at 4 bits for each element each equals our vector size, 512 bits.
@@ -848,6 +851,21 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
         // Load 4 blocks of mxfp4 elements
         // Also load the scales for each block. These loads are all done in order.
+
+        // Assert that the packed q4s we're loading are aligned and contiguous in memory.
+
+        printf("%zu\n", sizeof(__m512i));
+        printf("%zu\n", (uintptr_t)((const char*)&x[ib + 0].qs[0]));
+        printf("%zu\n", (uintptr_t)((const char*)&x[ib + 1].qs[0]));
+        printf("%zu\n", (uintptr_t)((const char*)&x[ib + 2].qs[0]));
+        printf("%zu\n", (uintptr_t)((const char*)&x[ib + 3].qs[0]));
+        
+        assert ((uintptr_t)((const char*)&x[ib + 0].qs[0]) % sizeof(__m512i) == 0);
+        assert ((const char*)&x[ib + 0].qs[0] + sizeof(x[ib + 0].qs) == (const char*)&x[ib + 1].qs[0]);
+        assert ((const char*)&x[ib + 1].qs[0] + sizeof(x[ib + 1].qs) == (const char*)&x[ib + 2].qs[0]);
+        assert ((const char*)&x[ib + 2].qs[0] + sizeof(x[ib + 2].qs) == (const char*)&x[ib + 3].qs[0]);
+        // assert (0);
+
         const float scale_q4_0 = GGML_E8M0_TO_FP32_HALF(x[ib + 0].e);
         const __m128i q4_0 = _mm_loadu_si128((const __m128i*)&x[ib + 0].qs);
         const float scale_q4_1 = GGML_E8M0_TO_FP32_HALF(x[ib + 1].e);
@@ -861,11 +879,13 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         const __m256i q4b_0 = bytes_from_nibbles_128i_to_256i(q4_0);
         const __m256i q4b_1 = bytes_from_nibbles_128i_to_256i(q4_1);
         const __m256i q4b_2 = bytes_from_nibbles_128i_to_256i(q4_2);
-        const __m256i q4b_3 = bytes_from_nibbles_128i_to_256i(q4_3);    
+        const __m256i q4b_3 = bytes_from_nibbles_128i_to_256i(q4_3);
+        
+        const __m512i q4b_01 = bytes_from_nibbles_2x128i_to_512i(q4_0, q4_1);
+        const __m512i q4b_23 = bytes_from_nibbles_2x128i_to_512i(q4_2, q4_3);
         
         // Load 4 blocks of q8 elements
         // Also load the scales for each block.
-        static_assert(QK8_0 * 8 == 256, "Wrong q8_0 size");
         const float scale_q8_0 = GGML_CPU_FP16_TO_FP32(y[ib + 0].d);
         const __m256i q8b_0 = _mm256_loadu_si256((const __m256i*)&y[ib + 0].qs);
         const float scale_q8_1 = GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
@@ -882,12 +902,12 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         const float scale_3 = scale_q4_3 * scale_q8_3;
 
         // Fused multiply-add: accum += scales * dot_products
-        accum = _mm512_fmadd_ps(scales_01, pf_01, accum);
-        accum = _mm512_fmadd_ps(scales_23, pf_23, accum);
+        // accum1 = _mm512_fmadd_ps(scales_01, pf_01, accum1);
+        // accum2 = _mm512_fmadd_ps(scales_23, pf_23, accum2);
     }
 
     // Horizontal sum of all 16 floats in the accumulator
-    sumf = _mm512_reduce_add_ps(accum);
+    sumf = _mm512_reduce_add_ps(accum1) + _mm512_reduce_add_ps(accum2);
 
 #elif defined __AVX2__
 
